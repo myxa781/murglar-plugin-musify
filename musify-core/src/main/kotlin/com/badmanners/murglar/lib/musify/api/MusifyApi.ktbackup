@@ -1,0 +1,520 @@
+package com.badmanners.murglar.lib.musify.api
+
+import com.badmanners.murglar.lib.core.network.NetworkMiddleware
+import com.badmanners.murglar.lib.core.network.NetworkRequest
+import com.badmanners.murglar.lib.core.network.ResponseConverters
+import com.badmanners.murglar.lib.core.model.track.source.Bitrate
+import com.badmanners.murglar.lib.core.model.track.source.Container
+import com.badmanners.murglar.lib.core.model.track.source.Extension
+import com.badmanners.murglar.lib.core.model.track.source.Source
+import java.net.URLDecoder
+
+// ── Модели ──────────────────────────────────────────────────────────────────
+data class MusifyTrackRaw(
+    val id: String,
+    val slug: String,
+    val title: String,
+    val artistNames: List<String>,
+    val artistIds: List<String>,
+    val albumId: String,
+    val albumName: String,
+    val albumSlug: String,
+    val year: String,
+    val coverUrl: String,
+    val durationSec: Int,
+    val bitrate: Int,
+    val playCount: Long,
+    val downloadPath: String,
+    val trackPageUrl: String,
+    val genre: String
+) {
+    val streamApiUrl: String get() = "https://musify.club/api/track/$id/stream-url"
+    val source: Source get() = Source(
+        id = id,
+        url = streamApiUrl,
+        tag = "${bitrate}kbps",
+        extension = Extension.MP3,
+        container = Container.PROGRESSIVE,
+        bitrate = if (bitrate >= 320) Bitrate.B_320 else Bitrate.B_128
+    )
+}
+
+data class MusifyArtistRaw(
+    val id: String,
+    val slug: String,
+    val name: String,
+    val country: String,
+    val genres: List<String>,
+    val albumCount: Int,
+    val trackCount: Int,
+    val coverUrl: String
+)
+
+data class MusifyAlbumRaw(
+    val id: String,
+    val slug: String,
+    val title: String,
+    val artistName: String,
+    val year: String,
+    val type: String,
+    val genres: List<String>,
+    val coverUrl: String,
+    val trackCount: Int
+)
+
+data class MusifyPlaylistRaw(
+    val id: String,
+    val slug: String,
+    val title: String,
+    val coverUrl: String,
+    val trackCount: Int
+)
+
+data class MusifyGenre(
+    val id: String,
+    val slug: String,
+    val name: String
+)
+
+data class MusifyStreamUrlResponse(
+    val url: String,
+    val title: String,
+    val cover: String,
+    val trackUrl: String
+)
+
+// ── API ──────────────────────────────────────────────────────────────────────
+class MusifyApi(private val network: NetworkMiddleware) {
+    companion object {
+        const val BASE = "https://musify.club"
+
+        private val RE_TRACK_LINK    = Regex("""/track/([^/"'?#]+?-(\d+))(?:['"?#/]|$)""")
+        private val RE_RELEASE_LINK  = Regex("""/release/([^/"'?#]+?-(\d+))(?:['"?#/]|$)""")
+        private val RE_ARTIST_LINK   = Regex("""/artist/([^/"'?#]+?-(\d+))(?:['"?#/]|$)""")
+        private val RE_PLAYLIST_LINK = Regex("""/theme/([^/"'?#]+?-(\d+))(?:['"?#/]|$)""")
+        private val RE_GENRE_LINK    = Regex("""/genre/([^/"'?#]+?-(\d+))(?:['"?#/]|$)""")
+        private val RE_DL            = Regex("""/track/dl/(\d+)/([^"'<>]+\.mp3)""")
+        private val RE_IMG           = Regex("""https?://\d+s?\.?musify\.club/img/[^"'\s>]+""")
+        private val RE_IMG_SRC       = Regex("""(?:data-src|src)\s*=\s*["']([^"']*?/img/[^"']+)["']""")
+
+        private val RE_JSON_URL      = Regex(""""url"\s*:\s*"([^"]+)"""")
+        private val RE_JSON_COVER    = Regex(""""cover"\s*:\s*"([^"]+)"""")
+
+        private val UA = "Mozilla/5.0 (Linux; Android 11; Pixel 5) AppleWebKit/537.36 " +
+                         "(KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
+    }
+
+    // ── Stream URL (реальный mp3 через API) ──────────────────────────────────
+    suspend fun getStreamUrl(trackId: String): String {
+        val json = getJson("$BASE/api/track/$trackId/stream-url")
+        val raw = RE_JSON_URL.find(json)?.groupValues?.get(1)
+            ?: error("No url in stream-url response for track $trackId")
+        return raw.replace("\\/", "/")
+    }
+
+    suspend fun getStreamUrlResponse(trackId: String): MusifyStreamUrlResponse {
+        val json  = getJson("$BASE/api/track/$trackId/stream-url")
+        val url   = RE_JSON_URL.find(json)?.groupValues?.get(1)?.replace("\\/", "/")
+            ?: error("No url in stream-url response")
+        val cover = RE_JSON_COVER.find(json)?.groupValues?.get(1)?.replace("\\/", "/") ?: ""
+        return MusifyStreamUrlResponse(url = url, title = "", cover = cover, trackUrl = "")
+    }
+
+    /** Получить один трек через API (без HTML страницы трека). */
+    suspend fun getTrack(slug: String, id: String): MusifyTrackRaw? {
+        // AJAX-список, отфильтрованный по конкретному релизу/треку — отдаёт чистый список треков
+        val html = get("$BASE/track/$slug-$id")
+        return parseTracks(html).firstOrNull { it.id == id } ?: parseTracks(html).firstOrNull()
+    }
+
+    // ── Списки (через AJAX /-/ когда возможно) ───────────────────────────────
+    suspend fun getTopTracks(): List<MusifyTrackRaw> =
+        parseTracks(get("$BASE/hits"))
+
+    suspend fun getTopReleases(): List<MusifyAlbumRaw> =
+        parseAlbums(get("$BASE/top"))
+
+    suspend fun getGenres(): List<MusifyGenre> {
+        val html   = get("$BASE/genre")
+        val result = mutableListOf<MusifyGenre>()
+        val seen   = mutableSetOf<String>()
+        val re = Regex("""<a[^>]+href="/genre/([^/"]+?-(\d+))"[^>]*>\s*([^<]+?)\s*</a>""")
+        for (m in re.findAll(html)) {
+            val slug = m.groupValues[1]
+            val id   = m.groupValues[2]
+            val name = m.groupValues[3].htmlDecode().trim()
+            if (id !in seen && name.isNotBlank()) {
+                seen += id
+                result += MusifyGenre(id, slug, name)
+            }
+        }
+        if (result.isEmpty()) {
+            for (m in RE_GENRE_LINK.findAll(html)) {
+                val slug = m.groupValues[1]
+                val id   = m.groupValues[2]
+                if (id in seen) continue; seen += id
+                result += MusifyGenre(id, slug, slug.slugToName(id))
+            }
+        }
+        return result
+    }
+
+    suspend fun getGenreTracks(slug: String, id: String, page: Int = 0): List<MusifyTrackRaw> =
+        parseTracks(get("$BASE/genre/$slug-$id/tracks${pageParam(page)}"))
+
+    suspend fun getGenreAlbums(slug: String, id: String, page: Int = 0): List<MusifyAlbumRaw> =
+        parseAlbums(get("$BASE/genre/$slug-$id${pageParam(page)}"))
+
+    // ── Исполнители ──────────────────────────────────────────────────────────
+    suspend fun getArtists(page: Int = 0): List<MusifyArtistRaw> =
+        parseArtists(get("$BASE/artist${pageParam(page)}"))
+
+    suspend fun getArtistTracks(slug: String, id: String, page: Int = 0): List<MusifyTrackRaw> =
+        parseTracks(get("$BASE/artist/$slug-$id${pageParam(page)}"))
+
+    suspend fun getArtistAlbums(slug: String, id: String, page: Int = 0): List<MusifyAlbumRaw> =
+        parseAlbums(get("$BASE/artist/$slug-$id/releases${pageParam(page)}"))
+
+    suspend fun getArtist(slug: String, id: String): MusifyArtistRaw? =
+        parseArtistPage(get("$BASE/artist/$slug-$id"), id, slug)
+
+    // ── Альбомы ──────────────────────────────────────────────────────────────
+    suspend fun getAlbums(page: Int = 0): List<MusifyAlbumRaw> =
+        parseAlbums(get("$BASE/releases/studio-albums${pageParam(page)}"))
+
+    suspend fun getCompilations(page: Int = 0): List<MusifyAlbumRaw> =
+        parseAlbums(get("$BASE/releases/compilations${pageParam(page)}"))
+
+    suspend fun getSoundtracks(page: Int = 0): List<MusifyAlbumRaw> =
+        parseAlbums(get("$BASE/releases/soundtracks${pageParam(page)}"))
+
+    suspend fun getReleaseTracks(slug: String, id: String): List<MusifyTrackRaw> =
+        parseTracks(get("$BASE/release/$slug-$id"))
+
+    suspend fun getRelease(slug: String, id: String): MusifyAlbumRaw? =
+        parseReleasePage(get("$BASE/release/$slug-$id"), id, slug)
+
+    // ── Плейлисты ────────────────────────────────────────────────────────────
+    suspend fun getPlaylists(page: Int = 0): List<MusifyPlaylistRaw> =
+        parsePlaylists(get("$BASE/theme${pageParam(page)}"))
+
+    suspend fun getPlaylistTracks(slug: String, id: String, page: Int = 0): List<MusifyTrackRaw> =
+        parseTracks(get("$BASE/theme/$slug-$id${pageParam(page)}"))
+
+    /** Получить инфо плейлиста (для корректного названия). */
+    suspend fun getPlaylist(slug: String, id: String): MusifyPlaylistRaw? {
+        val html = get("$BASE/theme/$slug-$id")
+        val title = Regex("""<h1[^>]*>(.*?)</h1>""", RegexOption.DOT_MATCHES_ALL)
+            .find(html)?.groupValues?.get(1)
+            ?.replace(Regex("<[^>]+>"), "")?.trim()?.htmlDecode()
+            ?: slug.slugToName(id)
+        val cover = bestCover(html)
+        return MusifyPlaylistRaw(id, slug, title, cover, RE_DL.findAll(html).count())
+    }
+
+    // ── Поиск ────────────────────────────────────────────────────────────────
+    suspend fun searchTracks(query: String, page: Int = 0): List<MusifyTrackRaw> {
+        val q = java.net.URLEncoder.encode(query, "UTF-8")
+        return parseTracks(get("$BASE/search?searchText=$q${if (page > 0) "&page=${page + 1}" else ""}"))
+    }
+
+    suspend fun searchArtists(query: String): List<MusifyArtistRaw> {
+        val q = java.net.URLEncoder.encode(query, "UTF-8")
+        return parseArtists(get("$BASE/search/artists?searchText=$q"))
+    }
+
+    suspend fun searchAlbums(query: String): List<MusifyAlbumRaw> {
+        val q = java.net.URLEncoder.encode(query, "UTF-8")
+        return parseAlbums(get("$BASE/search/releases?searchText=$q"))
+    }
+
+    suspend fun getLyrics(slug: String, id: String): String? {
+        val html   = get("$BASE/track/$slug-$id")
+        val marker = "Текст «"
+        val start  = html.indexOf(marker)
+        if (start < 0) return null
+        val body   = html.substring(start)
+        val sb     = StringBuilder()
+        val re     = Regex("""<p[^>]*>(.*?)</p>""", RegexOption.DOT_MATCHES_ALL)
+        for (m in re.findAll(body)) {
+            val line = m.groupValues[1].replace(Regex("<[^>]+>"), "").htmlDecode().trim()
+            if (line.isNotBlank()) { sb.append(line); sb.append("\n") }
+        }
+        return sb.toString().trim().ifEmpty { null }
+    }
+
+    // ── Парсеры ──────────────────────────────────────────────────────────────
+    fun parseTracks(html: String): List<MusifyTrackRaw> {
+        val result   = mutableListOf<MusifyTrackRaw>()
+        val seenIds  = mutableSetOf<String>()
+        val dlAll    = RE_DL.findAll(html).toList()
+        for ((idx, dl) in dlAll.withIndex()) {
+            val trackId = dl.groupValues[1]
+            if (trackId in seenIds) continue
+            val dlSlug  = dl.groupValues[2].removeSuffix(".mp3")
+
+            val blockStart = if (idx > 0) dlAll[idx - 1].range.last + 1 else 0
+            val blockEnd   = if (idx + 1 < dlAll.size) dlAll[idx + 1].range.first else html.length
+            val block      = html.substring(blockStart, blockEnd)
+            val dlInBlock  = dl.range.first - blockStart
+            val before     = block.substring(0, minOf(dlInBlock + 1, block.length))
+            val after      = block.substring(minOf(dlInBlock, block.length))
+
+            val trackPageMatch = RE_TRACK_LINK.findAll(before).lastOrNull()
+            val trackSlug = trackPageMatch?.groupValues?.get(1) ?: dlSlug
+
+            val title = if (trackPageMatch != null) {
+                val afterLink = before.substring(trackPageMatch.range.last)
+                extractTagText(afterLink, "a").ifEmpty { dlSlug.slugToName(trackId) }
+            } else dlSlug.slugToName(trackId)
+
+            val artistNames = mutableListOf<String>()
+            val artistIds   = mutableListOf<String>()
+            for (am in RE_ARTIST_LINK.findAll(before)) {
+                val aId   = am.groupValues[2]
+                val aSlug = am.groupValues[1]
+                val aCtx  = before.substring(am.range.last, minOf(am.range.last + 200, before.length))
+                val aName = extractTagText(aCtx, "a").ifEmpty { aSlug.slugToName(aId) }
+                if (aId !in artistIds) { artistIds += aId; artistNames += aName }
+            }
+
+            val releaseMatch = RE_RELEASE_LINK.findAll(before).lastOrNull()
+            val albumId   = releaseMatch?.groupValues?.get(2) ?: ""
+            val albumSlug = releaseMatch?.groupValues?.get(1) ?: ""
+            val albumName = if (releaseMatch != null) {
+                val rCtx = before.substring(releaseMatch.range.last, minOf(releaseMatch.range.last + 200, before.length))
+                extractTagText(rCtx, "a").ifEmpty { albumSlug.slugToName(albumId) }
+            } else ""
+
+            val year = Regex("""\b(19|20)\d{2}\b""").find(before)?.value ?: ""
+            val combinedCtx = before + after
+            val bitrate = when {
+                "320" in combinedCtx -> 320
+                "128" in combinedCtx -> 128
+                else                  -> 320
+            }
+            val durMatch = Regex("""(\d{1,2}):(\d{2})""").find(combinedCtx)
+            val durationSec = if (durMatch != null)
+                durMatch.groupValues[1].toInt() * 60 + durMatch.groupValues[2].toInt() else 0
+
+            val cover = upscaleCover(findBestCover(before, after))
+
+            seenIds += trackId
+            result += MusifyTrackRaw(
+                id           = trackId,
+                slug         = trackSlug,
+                title        = title.htmlDecode(),
+                artistNames  = artistNames.ifEmpty { listOf("Unknown") },
+                artistIds    = artistIds.ifEmpty  { listOf("0") },
+                albumId      = albumId,
+                albumName    = albumName.htmlDecode(),
+                albumSlug    = albumSlug,
+                year         = year,
+                coverUrl     = cover,
+                durationSec  = durationSec,
+                bitrate      = bitrate,
+                playCount    = 0L,
+                downloadPath = dl.value,
+                trackPageUrl = "$BASE/track/$trackSlug-$trackId",
+                genre        = ""
+            )
+        }
+        return result
+    }
+
+    fun parseAlbums(html: String): List<MusifyAlbumRaw> {
+        val result = mutableListOf<MusifyAlbumRaw>()
+        val seen   = mutableSetOf<String>()
+        val matches = RE_RELEASE_LINK.findAll(html).toList()
+        for ((idx, m) in matches.withIndex()) {
+            val id   = m.groupValues[2]
+            val slug = m.groupValues[1]
+            if (id in seen) continue; seen += id
+            val blockEnd = if (idx + 1 < matches.size) matches[idx + 1].range.first else html.length
+            val ctx = html.substring(m.range.first, minOf(blockEnd, html.length))
+            val title = extractTagText(ctx, "a", "h3", "h2", "span").ifEmpty { slug.slugToName(id) }
+            val year = Regex("""\b(19|20)\d{2}\b""").find(ctx)?.value ?: ""
+            val type = when {
+                "Студийный альбом" in ctx || "Studio album" in ctx -> "Студийный альбом"
+                "Сингл" in ctx || "Single" in ctx                  -> "Сингл"
+                "EP" in ctx                                         -> "EP"
+                "Саундтрек" in ctx || "Soundtrack" in ctx          -> "Саундтрек"
+                "Сборник" in ctx || "Compilation" in ctx           -> "Сборник"
+                else                                                -> "Альбом"
+            }
+            val genres = RE_GENRE_LINK.findAll(ctx).map { g ->
+                val gCtx = ctx.substring(g.range.last, minOf(g.range.last + 100, ctx.length))
+                extractTagText(gCtx, "a").htmlDecode().ifEmpty { g.groupValues[1].slugToName(g.groupValues[2]) }
+            }.filter { it.isNotBlank() }.toList()
+            val cover = upscaleCover(bestCover(ctx))
+            val artistMatch = RE_ARTIST_LINK.find(ctx)
+            val artistName  = if (artistMatch != null) {
+                val aCtx = ctx.substring(artistMatch.range.last, minOf(artistMatch.range.last + 200, ctx.length))
+                extractTagText(aCtx, "a").htmlDecode()
+                    .ifEmpty { artistMatch.groupValues[1].slugToName(artistMatch.groupValues[2]) }
+            } else ""
+            result += MusifyAlbumRaw(id, slug, title.htmlDecode(), artistName, year, type, genres, cover, 0)
+        }
+        return result
+    }
+
+    fun parseArtists(html: String): List<MusifyArtistRaw> {
+        val result  = mutableListOf<MusifyArtistRaw>()
+        val seen    = mutableSetOf<String>()
+        val matches = RE_ARTIST_LINK.findAll(html).toList()
+        for ((idx, m) in matches.withIndex()) {
+            val id   = m.groupValues[2]
+            val slug = m.groupValues[1]
+            if (id in seen) continue; seen += id
+            val blockEnd = if (idx + 1 < matches.size) matches[idx + 1].range.first else html.length
+            val ctx = html.substring(m.range.first, minOf(blockEnd, html.length))
+            val name = extractTagText(ctx, "a", "h2", "h3", "span").ifEmpty { slug.slugToName(id) }
+            if (name.length < 2) continue
+            val cover = upscaleCover(bestCover(ctx))
+            result += MusifyArtistRaw(id, slug, name.htmlDecode(), extractCountry(ctx), emptyList(), 0, 0, cover)
+        }
+        return result
+    }
+
+    fun parsePlaylists(html: String): List<MusifyPlaylistRaw> {
+        val result  = mutableListOf<MusifyPlaylistRaw>()
+        val seen    = mutableSetOf<String>()
+        val matches = RE_PLAYLIST_LINK.findAll(html).toList()
+        for ((idx, m) in matches.withIndex()) {
+            val id   = m.groupValues[2]
+            val slug = m.groupValues[1]
+            if (id in seen) continue; seen += id
+            val blockEnd = if (idx + 1 < matches.size) matches[idx + 1].range.first else html.length
+            val ctx = html.substring(m.range.first, minOf(blockEnd, html.length))
+            val title = extractTagText(ctx, "a", "h3", "span").ifEmpty { slug.slugToName(id) }
+            val cover = upscaleCover(bestCover(ctx))
+            result += MusifyPlaylistRaw(id, slug, title.htmlDecode(), cover, 0)
+        }
+        return result
+    }
+
+    private fun parseArtistPage(html: String, id: String, slug: String): MusifyArtistRaw? {
+        val name = Regex("""<h1[^>]*>(.*?)</h1>""", RegexOption.DOT_MATCHES_ALL)
+            .find(html)?.groupValues?.get(1)
+            ?.replace(Regex("<[^>]+>"), "")?.trim()?.htmlDecode()
+            ?: slug.slugToName(id)
+        val cover = upscaleCover(bestCover(html))
+        val country = extractCountry(html)
+        val genres  = RE_GENRE_LINK.findAll(html).map { m ->
+            val ctx = html.substring(m.range.last, minOf(m.range.last + 100, html.length))
+            extractTagText(ctx, "a").htmlDecode()
+        }.filter { it.isNotBlank() }.distinct().toList()
+        val albumCount = Regex("""Альбомов\D*(\d+)""").find(html)?.groupValues?.get(1)?.toIntOrNull() ?: 0
+        val trackCount = Regex("""Песен\D*(\d+)""").find(html)?.groupValues?.get(1)?.toIntOrNull() ?: 0
+        return MusifyArtistRaw(id, slug, name, country, genres, albumCount, trackCount, cover)
+    }
+
+    private fun parseReleasePage(html: String, id: String, slug: String): MusifyAlbumRaw? {
+        val title = Regex("""<h1[^>]*>(.*?)</h1>""", RegexOption.DOT_MATCHES_ALL)
+            .find(html)?.groupValues?.get(1)
+            ?.replace(Regex("<[^>]+>"), "")?.trim()?.htmlDecode()
+            ?: slug.slugToName(id)
+        val cover = upscaleCover(bestCover(html))
+        val year  = Regex("""\b(19|20)\d{2}\b""").find(html)?.value ?: ""
+        val artistMatch = RE_ARTIST_LINK.find(html)
+        val artistName  = if (artistMatch != null) {
+            val ctx = html.substring(artistMatch.range.last, minOf(artistMatch.range.last + 200, html.length))
+            extractTagText(ctx, "a").htmlDecode().ifEmpty { artistMatch.groupValues[1].slugToName(artistMatch.groupValues[2]) }
+        } else ""
+        val genres = RE_GENRE_LINK.findAll(html).map { m ->
+            val ctx = html.substring(m.range.last, minOf(m.range.last + 100, html.length))
+            extractTagText(ctx, "a").htmlDecode()
+        }.filter { it.isNotBlank() }.distinct().toList()
+        val trackCount = RE_DL.findAll(html).count()
+        return MusifyAlbumRaw(id, slug, title, artistName, year, "Альбом", genres, cover, trackCount)
+    }
+
+    // ── HTTP ─────────────────────────────────────────────────────────────────
+    suspend fun get(url: String): String {
+        val req = NetworkRequest.Builder(url, "GET")
+            .addHeader("User-Agent", UA)
+            .addHeader("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+            .addHeader("Accept-Language", "ru-RU,ru;q=0.9,en;q=0.8")
+            .addHeader("Accept-Charset", "UTF-8")
+            .addHeader("X-Requested-With", "XMLHttpRequest")
+            .addHeader("Referer", BASE)
+            .build()
+        return network.execute(req, ResponseConverters.asString()).result
+    }
+
+    private suspend fun getJson(url: String): String {
+        val req = NetworkRequest.Builder(url, "GET")
+            .addHeader("User-Agent", UA)
+            .addHeader("Accept", "application/json, */*")
+            .addHeader("X-Requested-With", "XMLHttpRequest")
+            .addHeader("Referer", BASE)
+            .build()
+        return network.execute(req, ResponseConverters.asString()).result
+    }
+
+    // ── Хелперы ──────────────────────────────────────────────────────────────
+    private fun pageParam(page: Int) = if (page > 0) "?page=${page + 1}" else ""
+
+    private fun findBestCover(before: String, after: String): String {
+        bestCover(before).let { if (it.isNotEmpty()) return it }
+        return bestCover(after)
+    }
+
+    /** Берём URL из src/data-src (важно для lazy-load), иначе любой img CDN. */
+    private fun bestCover(ctx: String): String {
+        RE_IMG_SRC.findAll(ctx).lastOrNull()?.groupValues?.get(1)?.let { return it }
+        return RE_IMG.findAll(ctx).lastOrNull()?.value ?: ""
+    }
+
+    /**
+     * Апскейл обложки до большого размера и нормализация протокола.
+     * У musify превью лежат как .../img/{w}x{h}/... — заменяем на крупный размер.
+     */
+    private fun upscaleCover(url: String): String {
+        if (url.isEmpty()) return ""
+        var u = url.replace("\\/", "/")
+        if (u.startsWith("//")) u = "https:$u"
+        // Заменяем размерный сегмент вида /60x60/ или /100x100/ на /1000x1000/
+        u = u.replace(Regex("""/img/\d{1,4}x\d{1,4}/"""), "/img/1000x1000/")
+        // Убираем тип превью (thumb/small) при наличии
+        u = u.replace("/thumbnails/", "/").replace("_small", "").replace("_thumb", "")
+        return u
+    }
+
+    private fun extractTagText(ctx: String, vararg tags: String): String {
+        for (tag in tags) {
+            val m = Regex("""<$tag[^>]*>(.*?)</$tag>""", RegexOption.DOT_MATCHES_ALL).find(ctx)
+            if (m != null) {
+                val text = m.groupValues[1].replace(Regex("<[^>]+>"), "").trim()
+                if (text.isNotBlank()) return text
+            }
+        }
+        return ""
+    }
+
+    private fun extractCountry(ctx: String): String =
+        Regex("""Откуда[^<]*</[^>]+>\s*<[^>]+>\s*([^<]+)<""").find(ctx)
+            ?.groupValues?.get(1)?.trim() ?: ""
+
+    /**
+     * Превращает slug (часто URL-кодированную кириллицу) в читаемое имя.
+     * Решает проблему "korol i shut" → декодирует %D0%9A... в «Король и Шут».
+     */
+    private fun String.slugToName(id: String): String {
+        val raw = this.substringBeforeLast("-$id")
+        val decoded = try { URLDecoder.decode(raw, "UTF-8") } catch (_: Exception) { raw }
+        return decoded.replace('-', ' ').replace('_', ' ').trim()
+            .replaceFirstChar { it.uppercase() }
+    }
+
+    private fun String.htmlDecode(): String = this
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&nbsp;", " ")
+        .replace(Regex("&#(\\d+);")) { it.groupValues[1].toInt().toChar().toString() }
+        .replace(Regex("&#x([0-9a-fA-F]+);")) { it.groupValues[1].toInt(16).toChar().toString() }
+        .trim()
+}
